@@ -136,6 +136,10 @@ export function is(node: ts.Node | undefined, ...kinds: ts.SyntaxKind[]): boolea
   return false;
 }
 
+export function isFunction(node: ts.Node | undefined): node is ts.FunctionLikeDeclaration {
+  return is(node, ...FUNCTION_LIKE);
+}
+
 function isToken(node: ts.Node): boolean {
   return node.kind <= ts.SyntaxKind.OfKeyword;
 }
