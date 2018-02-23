@@ -26,13 +26,13 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.List;
 import java.util.jar.JarFile;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
-import java.util.stream.IntStream;
 import java.util.zip.ZipEntry;
 import org.junit.BeforeClass;
 import org.junit.ClassRule;
@@ -50,6 +50,7 @@ import org.sonar.api.batch.rule.Checks;
 import org.sonar.api.batch.rule.internal.ActiveRulesBuilder;
 import org.sonar.api.batch.rule.internal.NewActiveRule;
 import org.sonar.api.batch.sensor.internal.SensorContextTester;
+import org.sonar.api.batch.sensor.issue.Issue;
 import org.sonar.api.config.Configuration;
 import org.sonar.api.issue.NoSonarFilter;
 import org.sonar.api.measures.FileLinesContext;
@@ -70,26 +71,34 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.mock;
 
 @RunWith(Parameterized.class)
-public class RuleConfigurationTest {
+public class JavaRulesIntegrationTest {
 
   private static final Path RULE_LINT_FILES = Paths.get("../../../sonarts-core/tests/rules");
   private static final Pattern ERROR_COMMENT = Pattern.compile("//.*\\^+[^<>]*");
+  private static final byte[] TSCONFIG = ("{" +
+    "  \"compilerOptions\": {\n" +
+    "    \"strict\": true,\n" +
+    "    \"target\": \"esnext\"\n" +
+    "  },\n" +
+    "  \"include\": [\"**/*.lint.ts\"]\n" +
+    "}").getBytes(StandardCharsets.UTF_8);
 
   @ClassRule
   public static TemporaryFolder temp = new TemporaryFolder();
 
-  private static File baseDir;
-  private SensorContextTester testContext;
+  private static File projectDir;
+  private static File workDir;
+  private SensorContextTester sensorContext;
   private static ExternalProcessStreamConsumer errorConsumer;
   private static ExecutableBundleFactory executableBundleFactory;
   private static FileLinesContextFactory fileLinesContextFactory;
   private static NoSonarFilter noSonarFilter;
 
-  @Parameter
+  @Parameter(0)
   public String ruleKey;
 
   @Parameter(1)
-  public String lintFile;
+  public String tsLintRule;
 
   @Parameters(name = "{0}:{1}")
   public static Collection<Object[]> data() {
@@ -101,23 +110,23 @@ public class RuleConfigurationTest {
 
   @BeforeClass
   public static void setUp() throws Exception {
-    baseDir = temp.newFolder();
-    Tests.runNPMInstall(baseDir, "typescript", "--no-save");
+    projectDir = temp.newFolder();
+    workDir = temp.newFolder();
+    Tests.runNPMInstall(projectDir, "typescript", "--no-save");
+    Files.write(projectDir.toPath().resolve("tsconfig.json"), TSCONFIG);
 
     errorConsumer = new ExternalProcessStreamConsumer();
     errorConsumer.start();
-    executableBundleFactory = RuleConfigurationTest::createAndDeploy;
+    executableBundleFactory = JavaRulesIntegrationTest::createAndDeploy;
     fileLinesContextFactory = (inputFile) -> mock(FileLinesContext.class);
     noSonarFilter = mock(NoSonarFilter.class);
   }
 
   private static ExecutableBundle createAndDeploy(File deployDestination, Configuration configuration) {
-    try {
-      File file = Tests.PLUGIN_LOCATION.getFile();
-      JarFile jar = new JarFile(file);
+    File file = Tests.PLUGIN_LOCATION.getFile();
+    try (JarFile jar = new JarFile(file)) {
       ZipEntry entry = jar.getEntry("sonarts-bundle.zip");
       InputStream inputStream = jar.getInputStream(entry);
-      File workDir = temp.newFolder();
       Zip.extract(inputStream, workDir);
       return new SonarTSCoreBundle(new File(workDir, "sonarts-bundle"), configuration);
     } catch (Exception e) {
@@ -127,46 +136,53 @@ public class RuleConfigurationTest {
 
   @Test
   public void test() throws Exception {
-    testContext = SensorContextTester.create(baseDir);
-    testContext.fileSystem().setWorkDir(temp.newFolder().toPath());
+    sensorContext = SensorContextTester.create(projectDir);
+    sensorContext.fileSystem().setWorkDir(workDir.toPath());
 
-    List<Integer> expectedLines = prepareTestFile(lintFile);
+    Path lintFile = lintFile(tsLintRule);
+    String testFixture = new String(Files.readAllBytes(lintFile));
+    createInputFile(lintFile.getFileName().toString(), testFixture);
+
     CheckFactory checkFactory = getCheckFactory(ruleKey);
     ExternalTypescriptSensor sensor = new ExternalTypescriptSensor(executableBundleFactory, noSonarFilter, fileLinesContextFactory, checkFactory, errorConsumer);
-    sensor.execute(testContext);
+    sensor.execute(sensorContext);
 
-    assertThat(testContext.allIssues().stream().allMatch(i -> i.ruleKey().rule().equals(ruleKey))).isTrue();
-    List<Integer> actualLines = testContext.allIssues().stream().map(i -> i.primaryLocation().textRange().start().line()).collect(Collectors.toList());
-    assertThat(actualLines).isEqualTo(expectedLines);
+    List<Integer> expectedLines = expectedIssues(testFixture);
+    assertThat(expectedLines).isNotEmpty();
+
+    assertThat(sensorContext.allIssues().stream().allMatch(i -> i.ruleKey().rule().equals(ruleKey))).isTrue();
+    List<Integer> actualIssues = sensorContext.allIssues().stream().map(JavaRulesIntegrationTest::issueLine).sorted().collect(Collectors.toList());
+    assertThat(actualIssues).isEqualTo(expectedLines);
   }
 
-  private List<Integer> prepareTestFile(String tslintRule) throws IOException {
-    Files.write(baseDir.toPath().resolve("tsconfig.json"), "{ \"include\": [\"**/*\"] }".getBytes(StandardCharsets.UTF_8));
-    List<String> lines = Files.readAllLines(lintFile(tslintRule));
-    List<Integer> expectedLines = IntStream.range(0, lines.size())
-      .filter(i -> ERROR_COMMENT.matcher(lines.get(i)).matches())
-      .boxed()
-      .collect(Collectors.toList());
-    testFile(lintFileName(tslintRule), lines.stream().collect(Collectors.joining("\n")));
+  private List<Integer> expectedIssues(String testFixture) {
+    String[] lines = testFixture.split("\n");
+    List<Integer> expectedLines = new ArrayList<>();
+    for (int i = 0; i < lines.length; i++) {
+      if (ERROR_COMMENT.matcher(lines[i]).matches()) {
+        expectedLines.add(i);
+      }
+    }
+    expectedLines.sort(null);
     return expectedLines;
   }
 
+  private static int issueLine(Issue i) {
+    return i.primaryLocation().textRange().start().line();
+  }
+
   private Path lintFile(String tslintRule) {
-    return RULE_LINT_FILES.resolve(tslintRule).resolve(lintFileName(tslintRule));
+    return RULE_LINT_FILES.resolve(tslintRule).resolve(tslintRule + ".lint.ts");
   }
 
-  private String lintFileName(String tsLintRule) {
-    return tsLintRule + ".lint.ts";
-  }
-
-  private void testFile(String filename, String content) throws IOException {
-    File filePath = new File(baseDir, filename);
+  private void createInputFile(String filename, String content) throws IOException {
+    File filePath = new File(projectDir, filename);
     Files.write(filePath.toPath(), content.getBytes(StandardCharsets.UTF_8));
-    InputFile inputFile = TestInputFileBuilder.create("module", baseDir, filePath)
+    InputFile inputFile = TestInputFileBuilder.create("module", projectDir, filePath)
       .setLanguage(TypeScriptLanguage.KEY)
       .setContents(content)
       .build();
-    testContext.fileSystem().add(inputFile);
+    sensorContext.fileSystem().add(inputFile);
   }
 
   private CheckFactory getCheckFactory(String activeRule) {
